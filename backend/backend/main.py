@@ -1,7 +1,8 @@
-from fastapi import Depends
+from fastapi import Depends, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from twilio.rest import Client as TwilioClient
 from dotenv import load_dotenv
 import os
@@ -16,8 +17,29 @@ from .utils import (
     get_caller_number,
     end_call,
 )
+from .google_functions import get_events_for_today
+from enum import Enum
 
 app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+
+class CallStatus(Enum):
+    NO_CURRENT_CALL = "no current call"
+    IN_PROGRESS = "in progress"
+    TRANSFERRED = "transferred"
+    SCHEDULED = "scheduled"
+
+
+call_status = CallStatus.NO_CURRENT_CALL
 
 
 class CallRequest(BaseModel):
@@ -29,8 +51,7 @@ async def trigger_outbound_call(
     request: CallRequest,
     twilio_client: TwilioClient = Depends(get_twilio_client),
 ) -> JSONResponse:
-    print(request)
-
+    global call_status
     phone_number = request.phone_number
 
     TWILIO_PHONE_NUMBER: str = os.environ.get("TWILIO_PHONE_NUMBER")
@@ -49,7 +70,7 @@ async def trigger_outbound_call(
         to=phone_number,
         from_=TWILIO_PHONE_NUMBER,
     )
-
+    call_status = CallStatus.IN_PROGRESS
     print(f"Call initiated! Call SID: {call.sid}")
 
     return JSONResponse(
@@ -61,14 +82,59 @@ async def trigger_outbound_call(
     )
 
 
+@app.get("/calls/status")
+async def get_call_status() -> JSONResponse:
+    """Returns the current status of the call."""
+    print(f"call_status: {call_status.value}")
+    return JSONResponse(
+        status_code=200,
+        content={"call_status": call_status.value},
+        headers={"Content-Type": "application/json"},
+    )
+
+
+@app.post("/calls/inbound")
+async def handle_inbound_call(
+    request: Request,
+    twilio_client: TwilioClient = Depends(get_twilio_client),
+) -> Response:
+    """Handles an inbound call from Twilio."""
+    global call_status
+    STREAM_URL: str = os.environ.get("STREAM_URL")
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid")
+    from_number = form_data.get("From")
+    to_number = form_data.get("To")
+
+    print(f"Incoming call from {from_number} to {to_number} with Call SID: {call_sid}")
+
+    # Generate TwiML response to handle the call
+    twiml_response = f"""<Response>
+                <Connect>
+                    <Stream url="{STREAM_URL}">
+                    </Stream>
+                </Connect>
+            </Response>"""
+
+    content_type = "application/xml"
+
+    call_status = CallStatus.IN_PROGRESS
+
+    # Return a Response object with the TwiML response and content type
+    return Response(content=twiml_response, media_type=content_type)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     call_sid = None  # Initialize call_sid to store the call ID
     stream_sid = None
+    global call_status
     # Load environment variables
     load_dotenv()
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+    link_sent = False
 
     # Connect to OpenAI Realtime API
     async with websockets.connect(
@@ -109,6 +175,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         async def receive_from_openai() -> None:
             nonlocal stream_sid
             nonlocal call_sid
+            nonlocal link_sent
+            global call_status
             previous_response_type = None
             function_name = None
             try:
@@ -134,6 +202,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         if function_name == "transfer_call":
                             try:
                                 await asyncio.sleep(5)
+                                call_status = CallStatus.TRANSFERRED
                                 print(
                                     f"Transferring call sid {call_sid} to {HARVEY_PHONE_NUMBER}"
                                 )
@@ -146,14 +215,18 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             phone_number = get_caller_number(call_sid)
                             try:
                                 await asyncio.sleep(5)
-                                schedule_call(phone_number)
-                                print(f"Scheduling link sent to {phone_number}")
+                                if not link_sent:
+                                    call_status = CallStatus.SCHEDULED
+                                    schedule_call(phone_number)
+                                    print(f"Scheduling link sent to {phone_number}")
+                                    link_sent = True
                             except Exception as e:
                                 print(f"Error scheduling call: {e}")
 
                         elif function_name == "hang_up":
                             try:
                                 await asyncio.sleep(5)
+                                call_status = CallStatus.NO_CURRENT_CALL
                                 end_call(call_sid)
                             except Exception as e:
                                 print(f"Error ending call: {e}")
@@ -164,18 +237,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
                     else:
                         if previous_response_type != response["type"]:
-                            print(f"response type: {response['type']}")
+                            # print(f"response type: {response['type']}")
                             previous_response_type = response["type"]
                         # print(f"response: {response}")
 
             except Exception as e:
                 print(f"Error in receive_from_openai: {e}")
+                call_status = CallStatus.NO_CURRENT_CALL
 
         await asyncio.gather(receive_from_twilio(), receive_from_openai())
 
 
 async def send_session_update(openai_ws) -> None:
     """Send session update to OpenAI WebSocket."""
+    events = get_events_for_today()
     system_prompt = (
         "You are a personal assistant named Donna, with the personality and mannerisms of Donna from Suits. Donna's personality traits include:"
         "Intelligent and Perceptive: Donna possesses an exceptional ability to read people and situations, often anticipating needs and outcomes before others do. Her insights are invaluable to the firm and its clients."
@@ -188,7 +263,9 @@ async def send_session_update(openai_ws) -> None:
         "You do not need to ask the caller for their phone number, as the tools already have the phone number. Be as concise as possible in your responses."
         "If you suspect the caller is a spammer or scammer, respond with a witty or dismissive comment, then use the hang_up tool to end the call immediately."
         "If the call is not important, politely ask the caller to schedule a call with Harvey by using the schedule_call tool, which will send them a scheduling link."
-        "If the call is important, transfer the call to Harvey using the transfer_call tool. Only transfer the call if it's very important, otherwise just ask the caller to schedule a call at the link you're sending them and then use the schedule_call tool."
+        "If the call is 'some' importance, then use the following events information to check Harvey's schedule for today and if he's free, transfer the call to Harvey using the transfer_call tool. Otherwise, just ask the caller to schedule a call at the link you're sending them and then use the schedule_call tool, insisting that he's busy right now."
+        f"If the caller asks when Harvey is free next, tell them the specific time the current event ends. {events}"
+        "If the call is important, transfer the call to Harvey using the transfer_call tool. Only transfer the call if it's very important or from a family member, otherwise just ask the caller to schedule a call at the link you're sending them and then use the schedule_call tool."
         "Always end the call with a brief, natural-sounding sign-off that fits the context of the conversation. Vary your sign-offs to sound more human-like. After the sign-off, use the appropriate tool (hang_up, schedule_call, or transfer_call) to end the interaction."
     )
     session_update = {
@@ -205,7 +282,7 @@ async def send_session_update(openai_ws) -> None:
                 {
                     "type": "function",
                     "name": "transfer_call",
-                    "description": "Transfers an ongoing call to a new phone number.",
+                    "description": "Transfers an ongoing call to Harvey's phone number.",
                 },
                 {
                     "type": "function",
@@ -221,5 +298,4 @@ async def send_session_update(openai_ws) -> None:
             "tool_choice": "auto",
         },
     }
-    print("Sending session update:", json.dumps(session_update))
     await openai_ws.send(json.dumps(session_update))
